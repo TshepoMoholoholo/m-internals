@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# m-internals :: toxic_hunter (Nanosleep / Scheduler Thrashing)
+# ==============================================================================
+set -euo pipefail
+
+if [[ -z "${1:-}" ]]; then
+    echo "Usage: toxic_hunter <PID>"
+    exit 1
+fi
+
+TARGET_PID=$1
+if [[ ! -d "/proc/$TARGET_PID" ]]; then
+    echo "Error: Process $TARGET_PID not found."
+    exit 1
+fi
+
+STAT=($(cat /proc/$TARGET_PID/stat 2>/dev/null || echo ""))
+if [[ ${#STAT[@]} -lt 4 ]]; then
+    echo "Error: Could not read /proc/$TARGET_PID/stat"
+    exit 1
+fi
+
+COMM=$(cat /proc/$TARGET_PID/comm 2>/dev/null)
+STATE=${STAT[2]}
+TARGET_PPID=${STAT[3]}
+WCHAN=$(cat /proc/$TARGET_PID/wchan 2>/dev/null || echo "UNKNOWN")
+
+echo "m-internals :: toxic_hunter"
+echo "Target : $TARGET_PID ($COMM) | Parent: $TARGET_PPID"
+echo "State  : $STATE | Wchan : $WCHAN"
+echo -e "\n  [~] Pooling scheduler data (3 samples, 1s interval)..."
+
+declare -A BASE_VOL
+declare -A BASE_INVOL
+declare -A STRIKES
+declare -A LAST_VOL_DELTA
+declare -A LAST_INVOL_DELTA
+
+for TASK_DIR in /proc/$TARGET_PID/task/*; do
+    if [[ -r "$TASK_DIR/status" ]]; then
+        TID=${TASK_DIR##*/}
+        BASE_VOL["$TID"]=$(awk -v k="voluntary_ctxt_switches:" '$1 == k {print $2}' "$TASK_DIR/status" 2>/dev/null | tr -d '[:space:]' || echo 0)
+        BASE_INVOL["$TID"]=$(awk -v k="nonvoluntary_ctxt_switches:" '$1 == k {print $2}' "$TASK_DIR/status" 2>/dev/null | tr -d '[:space:]' || echo 0)
+    fi
+done
+
+for SAMPLE in {1..3}; do
+    sleep 1
+    for TASK_DIR in /proc/$TARGET_PID/task/*; do
+        if [[ -r "$TASK_DIR/status" ]]; then
+            TID=${TASK_DIR##*/}
+            CUR_VOL=$(awk -v k="voluntary_ctxt_switches:" '$1 == k {print $2}' "$TASK_DIR/status" 2>/dev/null | tr -d '[:space:]' || echo 0)
+            CUR_INVOL=$(awk -v k="nonvoluntary_ctxt_switches:" '$1 == k {print $2}' "$TASK_DIR/status" 2>/dev/null | tr -d '[:space:]' || echo 0)
+
+            PREV_VOL=${BASE_VOL["$TID"]:-$CUR_VOL}
+            PREV_INVOL=${BASE_INVOL["$TID"]:-$CUR_INVOL}
+
+            DELTA_V=$((CUR_VOL - PREV_VOL))
+            DELTA_I=$((CUR_INVOL - PREV_INVOL))
+
+            LAST_VOL_DELTA["$TID"]=$DELTA_V
+            LAST_INVOL_DELTA["$TID"]=$DELTA_I
+
+            if (( DELTA_V > 1000 )) && (( DELTA_V > (DELTA_I * 10) )); then
+                STRIKES["$TID"]=$((${STRIKES["$TID"]:-0} + 1))
+            fi
+
+            BASE_VOL["$TID"]=$CUR_VOL
+            BASE_INVOL["$TID"]=$CUR_INVOL
+        fi
+    done
+done
+
+MAX_TID=$TARGET_PID
+MAX_STRIKES=0
+MAX_VOL_DELTA=0
+MAX_INVOL_DELTA=0
+
+for TID in "${!LAST_VOL_DELTA[@]}"; do
+    CUR_STRIKES=${STRIKES["$TID"]:-0}
+    if (( CUR_STRIKES >= MAX_STRIKES )); then
+        if (( ${LAST_VOL_DELTA["$TID"]} >= MAX_VOL_DELTA )); then
+            MAX_STRIKES=$CUR_STRIKES
+            MAX_VOL_DELTA=${LAST_VOL_DELTA["$TID"]}
+            MAX_INVOL_DELTA=${LAST_INVOL_DELTA["$TID"]}
+            MAX_TID=$TID
+        fi
+    fi
+done
+
+SYSCALL_LINE=$(cat /proc/$TARGET_PID/task/$MAX_TID/syscall 2>/dev/null || echo "N/A")
+SYSCALL_NUM=$(echo "$SYSCALL_LINE" | awk '{print $1}')
+TID_WCHAN=$(cat /proc/$TARGET_PID/task/$MAX_TID/wchan 2>/dev/null || echo "UNKNOWN")
+
+SYSCALL_NAME="UNKNOWN"
+if [[ "$SYSCALL_NUM" == "230" ]]; then
+    SYSCALL_NAME="clock_nanosleep"
+elif [[ "$SYSCALL_NUM" == "35" ]]; then
+    SYSCALL_NAME="nanosleep"
+fi
+
+DIAG_TITLE="HEALTHY SCHEDULING DYNAMICS"
+DIAG_TEXT="Thread context switch rates are within normal operational parameters. No abusive yielding detected."
+
+if (( MAX_STRIKES >= 2 )) && [[ "$TID_WCHAN" == *"nanosleep"* || "$SYSCALL_NUM" == "230" || "$SYSCALL_NUM" == "35" ]]; then
+    DIAG_TITLE="TOXIC MICRO-SLEEP THRASHING"
+    DIAG_TEXT="Thread is trapped in a sub-millisecond sleep loop. High voluntary yields with zero/low involuntary preemption indicate severe CPU cache pollution and administrative overhead."
+elif (( MAX_STRIKES >= 2 )); then
+    DIAG_TITLE="HIGH VOLUNTARY YIELDING (NON-NANOSLEEP)"
+    DIAG_TEXT="Thread is yielding aggressively ($MAX_VOL_DELTA cswch/s), but is not trapped in hrtimer_nanosleep. Check wchan for I/O, IPC, or network polling loops."
+fi
+
+echo -ne "\033[1A\033[2K" 
+
+echo "▼ THREAD SCHEDULER DYNAMICS [TID: $MAX_TID]"
+echo "  │"
+echo "  ├─ Context Switches (Per Second Avg)"
+if (( MAX_STRIKES >= 2 )); then
+    echo -e "  │  ├─ Voluntary (cswch)   : \033[0;31m$MAX_VOL_DELTA (Thrashing - $MAX_STRIKES/3 Strikes)\033[0m"
+else
+    echo "  │  ├─ Voluntary (cswch)   : $MAX_VOL_DELTA"
+fi
+echo "  │  └─ Involuntary (nvcsw) : $MAX_INVOL_DELTA"
+echo "  │"
+echo "  └─ Register State (Syscall Traversal)"
+echo "     ├─ Register Hex : $SYSCALL_LINE"
+if [[ "$SYSCALL_NAME" != "UNKNOWN" ]]; then
+    echo "     ├─ Syscall ID   : $SYSCALL_NUM"
+    echo "     └─ Mapping      : $SYSCALL_NAME"
+else
+    echo "     └─ Syscall ID   : $SYSCALL_NUM"
+fi
+echo ""
+echo "[!] DIAGNOSIS: $DIAG_TITLE"
+echo "$DIAG_TEXT" | fold -w 76 -s | sed 's/^/    /'
+echo ""
+echo "================================================================================"

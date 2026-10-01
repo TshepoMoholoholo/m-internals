@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# m-internals :: mi-hunt (Master Dispatcher)
+# SILENT EXECUTION ENGINE
+#
+# Reads target wchan and instantly hands execution off to the 
+# appropriate subsystem via exec.
+# ==============================================================================
+
+set -o pipefail
+
+# 1. VALIDATION (Silent failure on bad input)
+[[ -n "$1" ]] || { echo "Usage: mi-hunt <PID>"; exit 1; }
+TARGET_PID="$1"
+
+if ! [[ "$TARGET_PID" =~ ^[0-9]+$ ]] || [[ ! -d "/proc/${TARGET_PID}" ]]; then
+    echo "[!] Error: Invalid PID or process /proc/${TARGET_PID} does not exist." >&2
+    exit 1
+fi
+
+# 2. VFS STATE EXTRACTION
+TARGET_WCHAN=$(cat "/proc/${TARGET_PID}/wchan" 2>/dev/null)
+
+# 3. THE SWITCH (Silent Routing)
+case "$TARGET_WCHAN" in
+    # IPC Subsystem
+    pipe_wait|anon_pipe_read)
+        exec pipe_hunter "$TARGET_PID"
+        ;;
+        
+    # Network & I/O Polling Subsystem (Wildcard patched for GCC .constprop)
+    sk_data_wait|sk_wait_data|tcp_recvmsg|inet_csk_accept|poll_schedule_timeout*|do_select|core_sys_select)
+        exec sk_hunter "$TARGET_PID"
+        ;;
+        
+    # Event-Loop Subsystem
+    epoll_wait|epoll_pwait|do_epoll_wait)
+        exec epoll_hunter "$TARGET_PID"
+        ;;
+        
+    # Micro-Sleep / CPU Thrashing Subsystem
+    hrtimer_nanosleep|do_nanosleep|clock_nanosleep)
+        exec toxic_hunter "$TARGET_PID"
+        ;;
+        
+    # Mutex / Locking Subsystem (Patched for modern Linux kernels)
+    futex_wait_queue_me|futex_wait|futex_do_wait|do_futex)
+        exec futex_hunter "$TARGET_PID"
+        ;;
+        
+    # Process Lifecycle Subsystem
+    do_wait|wait_consider_task)
+        exec do_wait_hunter "$TARGET_PID"
+        ;;
+        
+    # Running State (No wait channel)
+    0|none|"")
+        TARGET_STATE=$(awk -F':\t*' '/^State:/ {print $2}' "/proc/${TARGET_PID}/status" 2>/dev/null | awk '{print $1}')
+        if [[ "$TARGET_STATE" == "R" ]]; then
+            echo "[i] Target is actively running on the CPU (State: R | Wchan: 0)"
+        else
+            echo "[i] Target has no wait channel, but state is: ${TARGET_STATE}"
+        fi
+        exit 0
+        ;;
+        
+    # Unmapped Catch-All
+    *)
+        echo "[!] Unmapped Wait Channel: ${TARGET_WCHAN}"
+        echo "    No m-internals subsystem currently handles this state."
+        exit 1
+        ;;
+esac

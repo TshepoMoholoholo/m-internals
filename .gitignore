@@ -1,0 +1,12 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Editor backups & swap files
+*.swp
+*.swo
+*~
+
+# Logs and test outputs
+*.log
+sandbox*/

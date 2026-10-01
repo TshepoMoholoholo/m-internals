@@ -1,0 +1,159 @@
+#!/bin/bash
+# ==============================================================================
+# m-internals :: futex_hunter
+# Description: Zero-dependency, non-invasive futex contention diagnostic utility.
+# ==============================================================================
+
+if [[ -z "$1" ]]; then
+    echo "Usage: $0 <PID>"
+    exit 1
+fi
+
+PID="$1"
+
+if [[ ! -d "/proc/$PID" ]]; then
+    echo "[!] Error: Process $PID does not exist or access denied."
+    exit 1
+fi
+
+# ---------------------------------------------------------
+# METADATA EXTRACTION
+# ---------------------------------------------------------
+# Parse /proc/PID/stat (Comm name is in (), which can have spaces, but we use basic parse)
+COMM=$(cat /proc/$PID/comm 2>/dev/null)
+STAT_RAW=$(cat /proc/$PID/stat 2>/dev/null)
+# Extract specific fields using awk to bypass space-in-name issues
+PPID=$(echo "$STAT_RAW" | awk -F') ' '{print $2}' | awk '{print $2}')
+STATE=$(echo "$STAT_RAW" | awk -F') ' '{print $2}' | awk '{print $1}')
+NUM_THREADS=$(echo "$STAT_RAW" | awk -F') ' '{print $2}' | awk '{print $18}')
+
+echo "m-internals :: futex_hunter"
+printf "Target : %-22s | Parent: %s\n" "$PID ($COMM)" "$PPID"
+printf "State  : %-22s | Total Threads : %s\n\n" "$STATE" "$NUM_THREADS"
+
+# ---------------------------------------------------------
+# CONTENTION MAPPING
+# ---------------------------------------------------------
+declare -A UADDR_COUNTS
+MAX_COUNT=0
+HOTSPOT_ADDR="None"
+
+for task_dir in /proc/$PID/task/*; do
+    if [[ -r "$task_dir/syscall" ]]; then
+        read -a sys_arr < "$task_dir/syscall" 2>/dev/null
+        sys_id="${sys_arr[0]}"
+        
+        # Check for futex syscalls (202 or 449 depending on arch/kernel)
+        if [[ "$sys_id" == "202" || "$sys_id" == "449" ]]; then
+            uaddr="${sys_arr[2]}"
+            if [[ -n "$uaddr" && "$uaddr" != "0x0" ]]; then
+                ((UADDR_COUNTS["$uaddr"]++))
+            fi
+        fi
+    fi
+done
+
+if [[ ${#UADDR_COUNTS[@]} -eq 0 ]]; then
+    echo "[!] No active futex contention detected. Process is not stalled on a mutex."
+    echo "================================================================================"
+    exit 0
+fi
+
+# Identify the primary hotspot
+for addr in "${!UADDR_COUNTS[@]}"; do
+    if [[ ${UADDR_COUNTS[$addr]} -gt $MAX_COUNT ]]; then
+        MAX_COUNT=${UADDR_COUNTS[$addr]}
+        HOTSPOT_ADDR=$addr
+    fi
+done
+
+# Print Topology Map
+echo "▼ FUTEX CONTENTION TOPOLOGY [Primary: $HOTSPOT_ADDR]"
+echo "  │"
+echo "  ├─ Contention Map"
+
+total_keys=${#UADDR_COUNTS[@]}
+current_key=0
+
+for addr in "${!UADDR_COUNTS[@]}"; do
+    ((current_key++))
+    branch="├─"
+    [[ $current_key -eq $total_keys ]] && branch="└─"
+    
+    hotspot_flag=""
+    [[ "$addr" == "$HOTSPOT_ADDR" ]] && hotspot_flag=" [HOTSPOT]"
+    
+    printf "  │  %s [%s] : %s thread(s) blocked%s\n" "$branch" "$addr" "${UADDR_COUNTS[$addr]}" "$hotspot_flag"
+done
+
+# ---------------------------------------------------------
+# TASK ELIMINATION (LOCK HOLDER ISOLATION)
+# ---------------------------------------------------------
+echo "  │"
+echo "  └─ Lock Holder Isolation (Task Elimination)"
+
+HOLDER_TID=""
+HOLDER_COMM=""
+HOLDER_WCHAN=""
+TARGET_STATE="Unknown"
+DIAGNOSIS="Software Bug: Thread stalled inside locked critical section."
+
+for task_dir in /proc/$PID/task/*; do
+    tid=$(basename "$task_dir")
+    wchan=$(cat "$task_dir/wchan" 2>/dev/null)
+    
+    # Ignore standard idle/wait channels to isolate the actual lock holder
+    if [[ "$wchan" != "0" && \
+          "$wchan" != *"futex"* && \
+          "$wchan" != *"epoll"* && \
+          "$wchan" != *"poll"* && \
+          "$wchan" != "do_wait" && \
+          "$wchan" != "pause" && \
+          "$wchan" != "core_sys_select" ]]; then
+          
+        HOLDER_TID=$tid
+        HOLDER_COMM=$(cat "$task_dir/comm" 2>/dev/null)
+        HOLDER_WCHAN=$wchan
+        break
+    fi
+done
+
+if [[ -n "$HOLDER_TID" ]]; then
+    # Translate WCHAN to Human-Readable State
+    if [[ "$HOLDER_WCHAN" == *"wait_woken"* || "$HOLDER_WCHAN" == *"read_chan"* || "$HOLDER_WCHAN" == *"tty"* ]]; then
+        TARGET_STATE="Interactive I/O (stdin / terminal read)"
+        DIAGNOSIS="Software Bug: Blocking read executed inside locked critical section."
+    elif [[ "$HOLDER_WCHAN" == *"pipe"* ]]; then
+        TARGET_STATE="Blocked on Pipe I/O"
+        DIAGNOSIS="Software Bug: Thread holding mutex is starved on a pipe read/write."
+    elif [[ "$HOLDER_WCHAN" == *"skb"* || "$HOLDER_WCHAN" == *"tcp"* || "$HOLDER_WCHAN" == *"udp"* ]]; then
+        TARGET_STATE="Network I/O Wait"
+        DIAGNOSIS="Software Bug: Blocking network call made inside a critical section."
+    elif [[ "$HOLDER_WCHAN" == *"sleep"* || "$HOLDER_WCHAN" == *"hrtimer"* ]]; then
+        TARGET_STATE="Explicit Sleep / Timer"
+        DIAGNOSIS="Software Bug: Thread sleeping while holding mutex (Priority Inversion/Stall)."
+    else
+        TARGET_STATE="System/Kernel Wait ($HOLDER_WCHAN)"
+    fi
+
+    echo "     ├─ Holder TID   : $HOLDER_TID"
+    echo "     ├─ Holder Name  : $HOLDER_COMM"
+    echo "     ├─ Wait Channel : $HOLDER_WCHAN"
+    echo "     └─ Target State : $TARGET_STATE"
+    echo ""
+    echo "[!] DIAGNOSIS: DEADLOCK / CRITICAL SECTION STALL"
+    echo "    $DIAGNOSIS"
+    echo "    $MAX_COUNT thread(s) starved waiting on uaddr $HOTSPOT_ADDR."
+else
+    echo "     ├─ Holder TID   : N/A (Evaded trace or running)"
+    echo "     ├─ Holder Name  : N/A"
+    echo "     ├─ Wait Channel : N/A"
+    echo "     └─ Target State : Running / In User Space"
+    echo ""
+    echo "[!] DIAGNOSIS: ACTIVE SPINNING / TRANSIENT CONTENTION"
+    echo "    No thread is suspended holding the lock. The lock holder is actively processing,"
+    echo "    meaning contention is extremely high but not completely deadlocked."
+fi
+
+echo ""
+echo "================================================================================"

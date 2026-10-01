@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# m-internals :: sk_hunter
+# Minimalist, production-grade network socket forensic tool.
+
+set -eo pipefail
+
+TARGET_PID="${1:-}"
+WAIT_PATTERNS="sk_wait_data|sk_stream_wait|poll_schedule_timeout|do_select|do_sys_poll|epoll_wait|io_uring|inet_csk_accept"
+
+if [[ -n "$TARGET_PID" ]]; then
+    PID_DIRS="/proc/$TARGET_PID"
+else
+    PID_DIRS=/proc/[0-9]*
+fi
+
+for pid_dir in $PID_DIRS; do
+    [[ -d "$pid_dir" ]] || continue
+    pid="${pid_dir##*/}"
+    [[ -r "$pid_dir/wchan" ]] || continue
+
+    wchan=$(cat "$pid_dir/wchan" 2>/dev/null || echo "")
+
+    if [[ -n "$wchan" ]] && echo "$wchan" | grep -qE "$WAIT_PATTERNS"; then
+        comm=$(cat "$pid_dir/comm" 2>/dev/null || echo "unknown")
+
+        if [[ -d "$pid_dir/fd" ]]; then
+            SS_CMD="ss -tupnoi"
+            if [[ -e "/proc/$pid/ns/net" ]]; then
+                SS_NS_CACHE=$(nsenter -t "$pid" -n $SS_CMD 2>/dev/null || ss -tupnoi 2>/dev/null || true)
+            else
+                SS_NS_CACHE=$(ss -tupnoi 2>/dev/null || true)
+            fi
+
+            for fd_path in "$pid_dir/fd"/*; do
+                [[ -e "$fd_path" ]] || continue
+                target=$(readlink "$fd_path" 2>/dev/null || true)
+
+                if [[ "$target" =~ socket:\[([0-9]+)\] ]]; then
+                    ino="${BASH_REMATCH[1]}"
+                    fd_num="${fd_path##*/}"
+
+                    ss_match=$(echo "$SS_NS_CACHE" | grep -A 1 -E "pid=$pid,fd=$fd_num\b|ino=$ino\b" || true)
+
+                    if [[ -n "$ss_match" ]]; then
+                        line1=$(echo "$ss_match" | head -n1)
+                        line2=$(echo "$ss_match" | tail -n1)
+
+                        read -r netid state recvq sendq local_addr peer_addr _ <<< "$line1"
+                        state="${state:-UNCONN}"
+                        recvq="${recvq:-0}"
+                        sendq="${sendq:-0}"
+
+                        # Parse Wire Metrics
+                        if [[ ! "$netid" =~ udp ]]; then
+                            snd_wnd=$(echo "$line2" | grep -o 'snd_wnd:[0-9]*' | cut -d: -f2 || echo "Unknown")
+                            timer=$(echo "$line1" | grep -o 'timer:([^)]*)' || echo "None")
+                            retrans_str=$(echo "$line2" | grep -o 'retrans:[0-9]*/[0-9]*' | cut -d: -f2 || echo "0/0")
+                            active_retrans=$(echo "$retrans_str" | cut -d/ -f1 || echo "0")
+                        else
+                            snd_wnd="N/A"
+                            timer="N/A"
+                            retrans_str="N/A"
+                            active_retrans="0"
+                        fi
+
+                        # Diagnostic Engine
+                        if [[ "$state" == "CLOSE-WAIT" ]]; then
+                            DIAGNOSIS="APPLICATION LEAK / ORPHANED FD\n    Remote sent FIN, but process failed to call close(). Data trapped in Recv-Q."
+                        elif [[ "$recvq" -gt 0 && "$state" != "LISTEN" ]]; then
+                            DIAGNOSIS="APPLICATION OVERLOAD / KERNEL BUFFER FULL\n    Unread data ($recvq bytes) trapped in Recv-Q. Process is failing to read."
+                        elif [[ "$snd_wnd" == "0" ]]; then
+                            DIAGNOSIS="REMOTE CHOKE / ZERO WINDOW\n    Remote receiver advertised a 0-byte window. Outbound traffic is halted."
+                        elif [[ "$active_retrans" -gt 0 ]]; then
+                            DIAGNOSIS="WIRE DEGRADATION / PACKET LOSS\n    Active retransmissions detected. Network segment is dropping packets."
+                        elif echo "$wchan" | grep -q "sk_wait_data"; then
+                            DIAGNOSIS="SYNCHRONOUS WAIT / DATA STARVATION\n    Process is explicitly blocked waiting for inbound socket data."
+                        elif [[ "$state" == "LISTEN" ]]; then
+                            DIAGNOSIS="HEALTHY LISTENER\n    Process is awaiting inbound connections. Queues are clear."
+                        elif echo "$wchan" | grep -qE "poll_schedule|do_select|epoll_wait|io_uring"; then
+                            DIAGNOSIS="HEALTHY ASYNC / EVENT WAIT\n    Process is idling efficiently in event loop. Queues and wire state are clear."
+                        else
+                            DIAGNOSIS="HEALTHY CONNECTION\n    No starvation or blocking constraints detected."
+                        fi
+
+                        # Branded Output Generation
+                        echo "m-internals :: sk_hunter"
+                        printf "%-32s | FD: %s | Proto: %s\n" "Target : $pid ($comm)" "$fd_num" "${netid^^}"
+                        printf "%-32s | Wchan : %s\n" "State  : $state" "$wchan"
+                        echo ""
+                        echo "▼ SOCKET METRICS [ino:$ino]"
+                        echo "  │"
+                        echo "  ├─ Endpoints"
+                        echo "  │  ├─ Local  : ${local_addr:-unknown}"
+                        echo "  │  └─ Remote : ${peer_addr:-unknown}"
+                        echo "  │"
+                        echo "  ├─ Queues"
+                        echo "  │  ├─ Recv-Q : $recvq"
+                        echo "  │  └─ Send-Q : $sendq"
+                        echo "  │"
+                        echo "  └─ Wire State"
+                        if [[ "$netid" =~ udp ]]; then
+                            echo "     └─ (Connectionless protocol - TCP metrics N/A)"
+                        else
+                            echo "     ├─ Window : $snd_wnd"
+                            echo "     ├─ Timers : $timer"
+                            echo "     └─ Drops  : $retrans_str"
+                        fi
+                        echo ""
+                        echo -e "[!] DIAGNOSIS: $DIAGNOSIS"
+                        echo ""
+                        echo "m-internals"
+                        echo "================================================================================"
+                    fi
+                fi
+            done
+        fi
+    fi
+done

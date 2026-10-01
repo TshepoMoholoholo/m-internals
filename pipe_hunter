@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# m-internals :: pipe_hunter
+#
+# Deterministic IPC topology and wait-channel correlation engine.
+# Maps file descriptors to kernel scheduler states to diagnose 0% CPU deadlocks.
+# ==============================================================================
+
+set -o pipefail
+
+usage() {
+    echo "Usage: $0 <PID>"
+    echo "Diagnoses pipe state, wait channels, and ghost reader deadlocks."
+    exit 1
+}
+
+[[ -n "$1" ]] || usage
+TARGET_PID="$1"
+
+# ------------------------------------------------------------------------------
+# 1. PRE-FLIGHT VALIDATION
+# ------------------------------------------------------------------------------
+if ! [[ "$TARGET_PID" =~ ^[0-9]+$ ]]; then
+    echo "[!] Error: PID must be a positive integer."
+    exit 1
+fi
+
+if [[ ! -d "/proc/${TARGET_PID}" ]]; then
+    echo "[!] Error: Process /proc/${TARGET_PID} does not exist."
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# 2. TARGET PROCESS STATE & WAIT CHANNEL INSPECTION
+# ------------------------------------------------------------------------------
+TARGET_COMM=$(awk -F':\t*' '/^Name:/ {print $2}' "/proc/${TARGET_PID}/status" 2>/dev/null)
+TARGET_STATE=$(awk -F':\t*' '/^State:/ {print $2}' "/proc/${TARGET_PID}/status" 2>/dev/null)
+TARGET_PPID=$(awk -F':\t*' '/^PPid:/ {print $2}' "/proc/${TARGET_PID}/status" 2>/dev/null)
+TARGET_WCHAN=$(cat "/proc/${TARGET_PID}/wchan" 2>/dev/null)
+
+echo "m-internals :: pipe_hunter"
+echo "Target : ${TARGET_PID} (${TARGET_COMM}) | Parent: ${TARGET_PPID:-unknown}"
+echo "State  : ${TARGET_STATE} | Wchan : ${TARGET_WCHAN:-none}"
+echo ""
+
+# ------------------------------------------------------------------------------
+# 3. LOCATE TARGET'S PIPE FILE DESCRIPTORS
+# ------------------------------------------------------------------------------
+declare -a TARGET_PIPES=()
+for fd_entry in "/proc/${TARGET_PID}/fd/"*; do
+    [[ -e "$fd_entry" ]] || continue
+    target=$(readlink "$fd_entry" 2>/dev/null)
+    if [[ "$target" == pipe:* ]]; then
+        fd_num="${fd_entry##*/}"
+        TARGET_PIPES+=("${fd_num}:${target}")
+    fi
+done
+
+if [[ ${#TARGET_PIPES[@]} -eq 0 ]]; then
+    echo "[i] No open pipe file descriptors found for PID ${TARGET_PID}."
+    exit 0
+fi
+
+# Visual UI Helper Function
+print_node() {
+    local title="$1"
+    local -n arr="$2"
+    local is_last="$3"
+    local prefix="├─"
+    local line_prefix="│"
+
+    [[ "$is_last" == "true" ]] && prefix="└─" && line_prefix=" "
+
+    printf "  %s %s (%d)\n" "$prefix" "$title" "${#arr[@]}"
+
+    if [[ ${#arr[@]} -gt 0 ]]; then
+        for item in "${arr[@]}"; do
+            printf "  %s  └─ %s\n" "$line_prefix" "$item"
+        done
+        [[ "$is_last" != "true" ]] && printf "  │\n"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 4. TOPOLOGY ANALYSIS ENGINE
+# ------------------------------------------------------------------------------
+for entry in "${TARGET_PIPES[@]}"; do
+    target_fd="${entry%%:*}"
+    target_inode="${entry#*:}"
+
+    declare -a writers=()
+    declare -a active_readers=()
+    declare -a ghost_readers=()
+    declare -a zombie_readers=()
+
+    for fd_path in /proc/[0-9]*/fd/*; do
+        [[ -e "$fd_path" ]] || continue
+
+        link_target=$(readlink "$fd_path" 2>/dev/null)
+        if [[ "$link_target" == "$target_inode" ]]; then
+            temp="${fd_path#/proc/}"
+            holder_pid="${temp%%/*}"
+            fd="${fd_path##*/}"
+            fdinfo_path="/proc/${holder_pid}/fdinfo/${fd}"
+            status_path="/proc/${holder_pid}/status"
+
+            [[ -r "$fdinfo_path" && -r "$status_path" ]] || continue
+
+            flags_octal=$(awk '/^flags:/ {print $2}' "$fdinfo_path" 2>/dev/null)
+            access_mode=$(( flags_octal & 3 ))
+
+            ppid=$(awk -F':\t*' '/^PPid:/ {print $2}' "$status_path" 2>/dev/null)
+            state=$(awk -F':\t*' '/^State:/ {print $2}' "$status_path" 2>/dev/null)
+            comm=$(awk -F':\t*' '/^Name:/ {print $2}' "$status_path" 2>/dev/null)
+            wchan=$(cat "/proc/${holder_pid}/wchan" 2>/dev/null)
+
+            # Classify relationship to target
+            role=""
+            if [[ "$holder_pid" -eq "$TARGET_PID" ]]; then
+                role="TARGET_SELF"
+            elif [[ "$holder_pid" -eq "${TARGET_PPID:--1}" ]]; then
+                role="PARENT"
+            elif [[ "$ppid" -eq "$TARGET_PID" ]]; then
+                role="CHILD"
+            elif [[ "$ppid" -eq 1 ]]; then
+                role="ORPHAN_INIT"
+            else
+                role="PPID=${ppid}"
+            fi
+
+            # Format the output string for the UI Tree
+            info_str="[${holder_pid}] ${comm} (FD:${fd})"
+
+            if [[ $access_mode -eq 1 ]]; then
+                writers+=("${info_str} | Wchan: ${wchan:-none} [${role}]")
+            elif [[ $access_mode -eq 0 || $access_mode -eq 2 ]]; then
+                if [[ "$state" =~ ^Z ]]; then
+                    zombie_readers+=("${info_str} | State: ${state} [${role}]")
+                elif [[ "$role" == "TARGET_SELF" || "$role" == "CHILD" || "$role" == "PARENT" ]]; then
+                    active_readers+=("${info_str} | Wchan: ${wchan:-none} [${role}]")
+                else
+                    ghost_readers+=("${info_str} | Wchan: ${wchan:-none} [${role}]")
+                fi
+            fi
+        fi
+    done
+
+    # Print the modern UI tree
+    echo "▼ IPC TOPOLOGY [${target_inode}] (Target FD: ${target_fd})"
+    echo "  │"
+    print_node "Writers       " writers false
+    print_node "Active Readers" active_readers false
+    print_node "Ghost Readers " ghost_readers false
+    print_node "Zombie Readers" zombie_readers true
+    echo ""
+
+    # --------------------------------------------------------------------------
+    # 5. DIAGNOSTIC INVARIANT EVALUATION (BIDIRECTIONAL)
+    # --------------------------------------------------------------------------
+    writer_in_pipe_wait=false
+    writer_is_sleeping=false
+    reader_in_pipe_read=false
+
+    for w in "${writers[@]}"; do
+        [[ "$w" =~ Wchan:\ pipe_wait ]] && writer_in_pipe_wait=true
+        [[ "$w" =~ Wchan:\ (hrtimer_nanosleep|do_nanosleep|poll_schedule_timeout|futex_wait_queue_me|epoll_wait) ]] && writer_is_sleeping=true
+    done
+
+    for r in "${active_readers[@]}"; do
+        [[ "$r" =~ Wchan:\ anon_pipe_read ]] && reader_in_pipe_read=true
+    done
+
+    if [[ ${#ghost_readers[@]} -gt 0 && ${#active_readers[@]} -eq 0 ]]; then
+        echo "[!] DIAGNOSIS: CRITICAL DEADLOCK (GHOST READER IDENTIFIED)"
+        echo "    Reason: The expected reader died or disconnected, but a detached"
+        echo "    descendant inherited the read file descriptor. Because reader_count > 0,"
+        echo "    the Linux kernel will NOT send SIGPIPE. Writers fill the 64KB buffer"
+        echo "    and hang indefinitely in 'pipe_wait'."
+        echo ""
+        echo "    Actionable Remediation:"
+        for ghost in "${ghost_readers[@]}"; do
+            g_pid=$(echo "$ghost" | grep -o '\[[0-9]*\]' | tr -d '[]' | head -n1)
+            echo "    --> Terminate leaked descriptor holder: kill -9 ${g_pid}"
+        done
+
+    elif [[ ${#zombie_readers[@]} -gt 0 && ${#active_readers[@]} -eq 0 && ${#ghost_readers[@]} -eq 0 ]]; then
+        echo "[!] DIAGNOSIS: UN-REAPED ZOMBIE READER"
+        echo "    Reason: Reader process has terminated (Z state) but has not been reaped"
+        echo "    via waitpid(). Verify parent signal handler or event loop."
+
+    elif [[ "$writer_in_pipe_wait" == true && ${#active_readers[@]} -gt 0 ]]; then
+        echo "[!] DIAGNOSIS: BUFFER BACKPRESSURE / READER STALL"
+        echo "    Reason: Writer is blocked in pipe_wait. Active readers exist, but they are"
+        echo "    not draining the kernel buffer fast enough or are hung themselves."
+
+    elif [[ "$reader_in_pipe_read" == true && "$writer_is_sleeping" == true ]]; then
+        echo "[!] DIAGNOSIS: READER STARVATION / WRITER ABANDONMENT"
+        echo "    Reason: Reader is waiting for data in anon_pipe_read, but the writer is"
+        echo "    asleep or idle on an internal timer/event loop."
+
+    elif [[ "$reader_in_pipe_read" == true && ${#writers[@]} -eq 0 ]]; then
+        echo "[!] DIAGNOSIS: ORPHANED READER"
+        echo "    Reason: Reader is blocked in anon_pipe_read with no active writers."
+
+    elif [[ ${#active_readers[@]} -eq 0 && ${#ghost_readers[@]} -eq 0 ]]; then
+        echo "[i] DIAGNOSIS: BROKEN PIPE / NO READERS"
+        echo "    Reason: Zero readers hold this inode. Writes will immediately trigger SIGPIPE."
+
+    else
+        echo "[i] DIAGNOSIS: NORMAL CONCURRENT IPC PIPELINE"
+    fi
+    echo ""
+done
